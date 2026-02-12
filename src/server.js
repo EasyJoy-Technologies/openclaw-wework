@@ -1,6 +1,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const xml2js = require('xml2js');
+const fs = require('fs');
 const { port, token, encodingAESKey, corpId } = require('./config');
 const { crypt, verifySignature, decryptEcho, decryptMessage } = require('./wecom');
 const { callOpenClaw } = require('./openclawClient');
@@ -13,6 +14,12 @@ const builder = new xml2js.Builder({ headless: true, cdata: true, rootName: 'xml
 
 // Track active processing count per user
 const userProcessingCounts = {};
+// Dedup cache: Set of MsgIds
+const processedMsgIds = new Set();
+// Clean up old IDs every hour
+setInterval(() => {
+  if (processedMsgIds.size > 5000) processedMsgIds.clear();
+}, 3600 * 1000);
 
 app.use(bodyParser.text({ type: '*/xml' }));
 
@@ -95,6 +102,14 @@ app.post('/wecom/callback', async (req, res) => {
   const userId = fromUser;
   const sessionKey = getSessionKey(userId);
   const msgType = msg?.MsgType;
+  const msgId = msg?.MsgId;
+
+  // Dedup check
+  if (msgId && processedMsgIds.has(msgId)) {
+    console.log(`Duplicate message ignored: ${msgId}`);
+    return res.type('text/plain').send('success');
+  }
+  if (msgId) processedMsgIds.add(msgId);
 
   // Ignore events (like enter_agent) to prevent spammy replies
   if (msgType === 'event') {
@@ -142,32 +157,39 @@ app.post('/wecom/callback', async (req, res) => {
         const description = msg.Description || '';
         const fileExt = msg.FileExt || ''; 
 
-        let success = false;
+        let filePath = null;
         try {
-          const filePath = await downloadMedia(mediaId);
-          let desc = `WeCom ${msgType} message received.\nLocalPath: ${filePath}\n\nIMPORTANT: You must use the 'image' tool (or 'read' for text files) to inspect the file at 'LocalPath' before answering. Do not guess. Describe the content of this new file.`;
+          filePath = await downloadMedia(mediaId);
+          let desc = `WeCom ${msgType} message received.\nMediaId: ${mediaId}\nLocalPath: ${filePath}`;
           if (picUrl) desc += `\nPicUrl: ${picUrl}`;
           if (format) desc += `\nFormat: ${format}`;
           if (recognition) desc += `\nASR: ${recognition}`;
           if (title) desc += `\nTitle: ${title}`;
           if (description) desc += `\nDescription: ${description}`;
           if (fileExt) desc += `\nFileExt: ${fileExt}`;
+          
+          desc += `\n\nIMPORTANT: You must use the 'image' tool (or 'read' for text/audio files) to inspect the file at 'LocalPath'. I have just downloaded it for you. It takes a moment to read. Please WAIT for the tool output before saying you can't see it. Do not guess.`;
 
           const replyText = await callOpenClaw({ message: desc, sessionKey, finishOnFirstText: false, timeoutMs: 120000 });
           if (replyText) {
             await sendText(fromUser, replyText);
-            success = true;
             console.log('assistant media reply sent');
           }
         } catch (err) {
           console.error('media async error', err.message || err);
-          if (!success) {
-            try {
-              await sendText(fromUser, '已收到你的文件，但处理失败，请稍后重试');
-              console.log('fallback media sendText sent');
-            } catch (e2) {
-              console.error('fallback sendText error', e2.message || e2);
-            }
+          try {
+            await sendText(fromUser, '已收到你的文件，但处理失败，请稍后重试');
+            console.log('fallback media sendText sent');
+          } catch (e2) {
+            console.error('fallback sendText error', e2.message || e2);
+          }
+        } finally {
+          // Cleanup temp file
+          if (filePath && fs.existsSync(filePath)) {
+            fs.unlink(filePath, (err) => {
+              if (err) console.error('cleanup failed for', filePath, err);
+              else console.log('cleaned up', filePath);
+            });
           }
         }
         return;
