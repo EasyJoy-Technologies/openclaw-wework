@@ -12,14 +12,10 @@ const { sendText } = require('./send');
 const app = express();
 const builder = new xml2js.Builder({ headless: true, cdata: true, rootName: 'xml' });
 
-// Track active processing count per user
-const userProcessingCounts = {};
-// Dedup cache: Set of MsgIds
-const processedMsgIds = new Set();
-// Clean up old IDs every hour
-setInterval(() => {
-  if (processedMsgIds.size > 5000) processedMsgIds.clear();
-}, 3600 * 1000);
+// --- Message Buffer State ---
+// Key: userId, Value: { timer, messages: [], processing: bool }
+const userBuffers = {};
+const DEBOUNCE_MS = 1500; // Wait 1.5s to combine text+media
 
 app.use(bodyParser.text({ type: '*/xml' }));
 
@@ -52,6 +48,12 @@ function getSessionKey(userId) {
   }
   return sessionKey;
 }
+
+// Dedup cache: Set of MsgIds
+const processedMsgIds = new Set();
+setInterval(() => {
+  if (processedMsgIds.size > 5000) processedMsgIds.clear();
+}, 3600 * 1000);
 
 app.get('/wecom/callback', (req, res) => {
   const { msg_signature: msgSignature, signature, timestamp, nonce, echostr } = req.query;
@@ -100,136 +102,137 @@ app.post('/wecom/callback', async (req, res) => {
   if (!fromUser || !toUser) return res.type('text/plain').send('success');
 
   const userId = fromUser;
-  const sessionKey = getSessionKey(userId);
   const msgType = msg?.MsgType;
   const msgId = msg?.MsgId;
 
   // Dedup check
   if (msgId) {
-    const isDup = processedMsgIds.has(msgId);
-    console.log('Dedup check:', msgId, isDup);
-    if (isDup) {
+    if (processedMsgIds.has(msgId)) {
+      console.log(`Duplicate message ignored: ${msgId}`);
       return res.type('text/plain').send('success');
     }
     processedMsgIds.add(msgId);
   }
 
-  // Ignore events (like enter_agent) to prevent spammy replies
+  // Ignore events
   if (msgType === 'event') {
     return res.type('text/plain').send('success');
   }
 
-  // Handle Ack logic based on processing state
-  const currentCount = userProcessingCounts[userId] || 0;
-  if (currentCount > 0) {
-    res.type('text/plain').send('success');
-  } else {
+  // Init buffer for user if needed
+  if (!userBuffers[userId]) {
+    userBuffers[userId] = { timer: null, messages: [], processing: false };
+  }
+  const buffer = userBuffers[userId];
+
+  // If buffer empty and not processing, send immediate Ack
+  if (buffer.messages.length === 0 && !buffer.processing) {
     const ackReply = buildTextReply(fromUser, toUser, '已收到，稍后回复');
     res.type('application/xml').send(ackReply);
+  } else {
+    // Already buffered or processing previous batch, silence this one
+    res.type('text/plain').send('success');
   }
 
-  // Increment active count
-  userProcessingCounts[userId] = currentCount + 1;
+  // Add message to buffer
+  buffer.messages.push({ msg, type: msgType });
 
-  // Async handling
-  (async () => {
-    try {
-      if (msgType === 'text') {
-        const content = Array.isArray(msg.Content) ? msg.Content.join('') : msg.Content;
-        let replyText = '';
-        try {
-          replyText = await callOpenClaw({ message: content, sessionKey, finishOnFirstText: false, timeoutMs: 60000 });
-        } catch (err) {
-          console.error('openclaw error (text async)', err.message || err);
-        }
-        try {
-          await sendText(fromUser, replyText || '助手暂时不可用，请稍后重试');
-          console.log('assistant text reply sent');
-        } catch (e2) {
-          console.error('sendText error (text)', e2.message || e2);
-        }
-        return;
-      }
+  // Reset debounce timer
+  if (buffer.timer) clearTimeout(buffer.timer);
+  
+  buffer.timer = setTimeout(() => {
+    processBatch(userId, fromUser);
+  }, DEBOUNCE_MS);
+});
 
-      if (msgType === 'image' || msgType === 'voice' || msgType === 'audio' || msgType === 'file') {
-        const mediaId = msg.MediaId || msg.MediaID || '';
-        const picUrl = msg.PicUrl || '';
-        const format = msg.Format || '';
-        const recognition = msg.Recognition || '';
-        const title = msg.Title || '';
-        const description = msg.Description || '';
-        const fileExt = msg.FileExt || ''; 
+async function processBatch(userId, fromUser) {
+  const buffer = userBuffers[userId];
+  if (!buffer || buffer.messages.length === 0) return;
 
-        let filePath = null;
-        try {
-          filePath = await downloadMedia(mediaId);
-          let desc = `WeCom ${msgType} message received.\nMediaId: ${mediaId}\nLocalPath: ${filePath}`;
-          if (picUrl) desc += `\nPicUrl: ${picUrl}`;
-          if (format) desc += `\nFormat: ${format}`;
-          if (recognition) desc += `\nASR: ${recognition}`;
-          if (title) desc += `\nTitle: ${title}`;
-          if (description) desc += `\nDescription: ${description}`;
-          if (fileExt) desc += `\nFileExt: ${fileExt}`;
-          
-          desc += `\n\nIMPORTANT: I have just downloaded the file to 'LocalPath'. You MUST call the 'image' tool (or 'read' for text/audio files) to see it. DO NOT apologize. DO NOT say you haven't seen it. Simply call the tool and wait. If you cannot see the image content immediately, you MUST call the 'image' tool on the 'LocalPath'.`;
+  buffer.processing = true;
+  const batch = [...buffer.messages];
+  buffer.messages = []; // clear buffer for next batch
+  buffer.timer = null;
 
-          const rawReply = await callOpenClaw({ message: desc, sessionKey, finishOnFirstText: false, timeoutMs: 120000 });
-          
-          let finalText = rawReply || '';
-          
-          // Regex to strip leading apologies if there is other content
-          // This matches "Sorry..." or "抱歉..." at the start, followed by anything, then a newline or end.
-          // It's a simple heuristic.
-          const hallucinationPatterns = [
-            /^(抱歉|对不起|Sorry).{0,50}(看|图片|上传|see|image|upload).*?(\n|$)/is
-          ];
-          
-          for (const pattern of hallucinationPatterns) {
-            if (pattern.test(finalText)) {
-               // Only strip if what remains is substantial (e.g. > 20 chars), implying a description followed.
-               // If the WHOLE message is just the apology, we keep it (so user knows it failed).
-               const stripped = finalText.replace(pattern, '').trim();
-               if (stripped.length > 20) {
-                 console.log('Stripping hallucinated apology from reply');
-                 finalText = stripped;
-               }
-            }
-          }
+  console.log(`Processing batch for ${userId}: ${batch.length} messages`);
 
-          if (finalText) {
-            await sendText(fromUser, finalText);
-            console.log('assistant media reply sent');
-          }
-        } catch (err) {
-          console.error('media async error', err.message || err);
-          try {
-            await sendText(fromUser, '已收到你的文件，但处理失败，请稍后重试');
-            console.log('fallback media sendText sent');
-          } catch (e2) {
-            console.error('fallback sendText error', e2.message || e2);
-          }
-        } finally {
-          // Cleanup temp file
-          if (filePath && fs.existsSync(filePath)) {
-            fs.unlink(filePath, (err) => {
-              if (err) console.error('cleanup failed for', filePath, err);
-              else console.log('cleaned up', filePath);
-            });
-          }
-        }
-        return;
-      }
-    } finally {
-      // Decrement active count
-      if (userProcessingCounts[userId]) {
-        userProcessingCounts[userId]--;
-        if (userProcessingCounts[userId] <= 0) {
-          delete userProcessingCounts[userId];
-        }
+  const sessionKey = getSessionKey(userId);
+  let combinedPrompt = '';
+  const tempFiles = [];
+
+  // Sort: text first, then media? Or chronological?
+  // Since we push in arrival order, chronological is best.
+  // But we want to ensure text context is applied to image.
+  
+  for (const item of batch) {
+    const m = item.msg;
+    if (item.type === 'text') {
+      combinedPrompt += `User Text: ${m.Content}\n\n`;
+    } else if (['image', 'voice', 'audio', 'file'].includes(item.type)) {
+      try {
+        const mediaId = m.MediaId;
+        const filePath = await downloadMedia(mediaId);
+        tempFiles.push(filePath);
+        combinedPrompt += `User File (${item.type}):\nMediaId: ${mediaId}\nLocalPath: ${filePath}\n`;
+        if (m.PicUrl) combinedPrompt += `PicUrl: ${m.PicUrl}\n`;
+        if (m.Recognition) combinedPrompt += `ASR: ${m.Recognition}\n`;
+        combinedPrompt += '\n';
+      } catch (e) {
+        console.error('Media download failed', e);
+        combinedPrompt += `[Media download failed: ${m.MediaId}]\n`;
       }
     }
-  })();
-});
+  }
+
+  if (tempFiles.length > 0) {
+    combinedPrompt += `\nIMPORTANT: I have just downloaded ${tempFiles.length} file(s) to the local paths listed above. You MUST call the 'image' tool (or 'read' for text/audio) to inspect them. DO NOT apologize. DO NOT say you haven't seen them. Simply call the tool and wait for the content.`;
+  }
+
+  try {
+    // Call assistant with combined prompt
+    // Timeout 120s because batch might have multiple images
+    const replyText = await callOpenClaw({ message: combinedPrompt, sessionKey, finishOnFirstText: false, timeoutMs: 120000 });
+    
+    // Filter apologies
+    let finalText = replyText || '';
+    const hallucinationPatterns = [
+      /^(抱歉|对不起|Sorry).{0,50}(看|图片|上传|see|image|upload).*?(\n|$)/is
+    ];
+    for (const pattern of hallucinationPatterns) {
+      if (pattern.test(finalText)) {
+         const stripped = finalText.replace(pattern, '').trim();
+         if (stripped.length > 20) {
+           finalText = stripped;
+         }
+      }
+    }
+
+    if (finalText) {
+      await sendText(fromUser, finalText);
+      console.log('Batch reply sent');
+    }
+  } catch (err) {
+    console.error('Batch processing error', err.message || err);
+    try {
+      await sendText(fromUser, '消息处理遇到问题，请稍后重试');
+    } catch (_) {}
+  } finally {
+    // Cleanup temp files
+    for (const fp of tempFiles) {
+      if (fs.existsSync(fp)) fs.unlink(fp, () => {});
+    }
+    // Mark processing done
+    // If new messages arrived during processing, buffer.messages is not empty,
+    // but the timer isn't running? No, new messages set new timer.
+    // So we just clear the flag.
+    buffer.processing = false;
+    
+    // Clean up empty user entry?
+    if (buffer.messages.length === 0 && !buffer.timer) {
+      delete userBuffers[userId];
+    }
+  }
+}
 
 app.head('/wecom/callback', (_req, res) => res.status(200).end());
 app.get('/healthz', (_req, res) => res.send('ok'));
