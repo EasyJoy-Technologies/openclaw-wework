@@ -11,6 +11,9 @@ const { sendText } = require('./send');
 const app = express();
 const builder = new xml2js.Builder({ headless: true, cdata: true, rootName: 'xml' });
 
+// Track active processing count per user
+const userProcessingCounts = {};
+
 app.use(bodyParser.text({ type: '*/xml' }));
 
 function buildTextReply(toUser, fromUser, content) {
@@ -93,52 +96,89 @@ app.post('/wecom/callback', async (req, res) => {
   const sessionKey = getSessionKey(userId);
   const msgType = msg?.MsgType;
 
-  // Immediate ack to user
-  const ackReply = buildTextReply(fromUser, toUser, '已收到，稍后回复');
-  res.type('application/xml').send(ackReply);
+  // Ignore events (like enter_agent) to prevent spammy replies
+  if (msgType === 'event') {
+    return res.type('text/plain').send('success');
+  }
+
+  // Handle Ack logic based on processing state
+  const currentCount = userProcessingCounts[userId] || 0;
+  if (currentCount > 0) {
+    // Already processing previous message(s), silence the ack
+    res.type('text/plain').send('success');
+  } else {
+    // First message in a while, send Ack
+    const ackReply = buildTextReply(fromUser, toUser, '已收到，稍后回复');
+    res.type('application/xml').send(ackReply);
+  }
+
+  // Increment active count
+  userProcessingCounts[userId] = currentCount + 1;
 
   // Async handling
   (async () => {
-    if (msgType === 'text') {
-      const content = Array.isArray(msg.Content) ? msg.Content.join('') : msg.Content;
-      let replyText = '';
-      try {
-        replyText = await callOpenClaw({ message: content, sessionKey, finishOnFirstText: false, timeoutMs: 60000 });
-      } catch (err) {
-        console.error('openclaw error (text async)', err.message || err);
-      }
-      try {
-        await sendText(fromUser, replyText || '助手暂时不可用，请稍后重试');
-        console.log('assistant text reply sent');
-      } catch (e2) {
-        console.error('sendText error (text)', e2.message || e2);
-      }
-      return;
-    }
-
-    if (msgType === 'image' || msgType === 'voice' || msgType === 'audio') {
-      const mediaId = msg.MediaId || msg.MediaID || '';
-      const picUrl = msg.PicUrl || '';
-      const format = msg.Format || '';
-      const recognition = msg.Recognition || '';
-      try {
-        const filePath = await downloadMedia(mediaId);
-        const desc = `WeCom ${msgType} message\nMediaId: ${mediaId}\nPicUrl: ${picUrl}\nFormat: ${format}\nASR: ${recognition}\nLocalPath: ${filePath}`;
-        const replyText = await callOpenClaw({ message: desc, sessionKey, finishOnFirstText: false, timeoutMs: 60000 });
-        if (replyText) {
-          await sendText(fromUser, replyText);
-          console.log('assistant media reply sent');
-        }
-      } catch (err) {
-        console.error('media async error', err.message || err);
+    try {
+      if (msgType === 'text') {
+        const content = Array.isArray(msg.Content) ? msg.Content.join('') : msg.Content;
+        let replyText = '';
         try {
-          await sendText(fromUser, '已收到你的图片/音频，但处理失败，请稍后重试');
-          console.log('fallback media sendText sent');
+          // Timeout extended to 60s
+          replyText = await callOpenClaw({ message: content, sessionKey, finishOnFirstText: false, timeoutMs: 60000 });
+        } catch (err) {
+          console.error('openclaw error (text async)', err.message || err);
+        }
+        try {
+          await sendText(fromUser, replyText || '助手暂时不可用，请稍后重试');
+          console.log('assistant text reply sent');
         } catch (e2) {
-          console.error('fallback sendText error', e2.message || e2);
+          console.error('sendText error (text)', e2.message || e2);
+        }
+        return;
+      }
+
+      if (msgType === 'image' || msgType === 'voice' || msgType === 'audio' || msgType === 'file') {
+        const mediaId = msg.MediaId || msg.MediaID || '';
+        const picUrl = msg.PicUrl || '';
+        const format = msg.Format || '';
+        const recognition = msg.Recognition || '';
+        const title = msg.Title || '';
+        const description = msg.Description || '';
+        const fileExt = msg.FileExt || ''; 
+
+        try {
+          const filePath = await downloadMedia(mediaId);
+          let desc = `WeCom ${msgType} message\nMediaId: ${mediaId}\nLocalPath: ${filePath}`;
+          if (picUrl) desc += `\nPicUrl: ${picUrl}`;
+          if (format) desc += `\nFormat: ${format}`;
+          if (recognition) desc += `\nASR: ${recognition}`;
+          if (title) desc += `\nTitle: ${title}`;
+          if (description) desc += `\nDescription: ${description}`;
+          if (fileExt) desc += `\nFileExt: ${fileExt}`;
+
+          const replyText = await callOpenClaw({ message: desc, sessionKey, finishOnFirstText: false, timeoutMs: 120000 });
+          if (replyText) {
+            await sendText(fromUser, replyText);
+            console.log('assistant media reply sent');
+          }
+        } catch (err) {
+          console.error('media async error', err.message || err);
+          try {
+            await sendText(fromUser, '已收到你的文件，但处理失败，请稍后重试');
+            console.log('fallback media sendText sent');
+          } catch (e2) {
+            console.error('fallback sendText error', e2.message || e2);
+          }
+        }
+        return;
+      }
+    } finally {
+      // Decrement active count
+      if (userProcessingCounts[userId]) {
+        userProcessingCounts[userId]--;
+        if (userProcessingCounts[userId] <= 0) {
+          delete userProcessingCounts[userId];
         }
       }
-      return;
     }
   })();
 });
