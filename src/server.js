@@ -105,11 +105,14 @@ app.post('/wecom/callback', async (req, res) => {
   const msgId = msg?.MsgId;
 
   // Dedup check
-  if (msgId && processedMsgIds.has(msgId)) {
-    console.log(`Duplicate message ignored: ${msgId}`);
-    return res.type('text/plain').send('success');
+  if (msgId) {
+    const isDup = processedMsgIds.has(msgId);
+    console.log('Dedup check:', msgId, isDup);
+    if (isDup) {
+      return res.type('text/plain').send('success');
+    }
+    processedMsgIds.add(msgId);
   }
-  if (msgId) processedMsgIds.add(msgId);
 
   // Ignore events (like enter_agent) to prevent spammy replies
   if (msgType === 'event') {
@@ -168,7 +171,7 @@ app.post('/wecom/callback', async (req, res) => {
           if (description) desc += `\nDescription: ${description}`;
           if (fileExt) desc += `\nFileExt: ${fileExt}`;
           
-          desc += `\n\nIMPORTANT: You must use the 'image' tool (or 'read' for text/audio files) to inspect the file at 'LocalPath'. I have just downloaded it for you. It takes a moment to read. Please WAIT for the tool output before saying you can't see it. Do not guess.`;
+          desc += `\n\nIMPORTANT: I have just downloaded the file to 'LocalPath'. You MUST call the 'image' tool (or 'read' for text/audio files) to see it. DO NOT apologize. DO NOT say you haven't seen it. Simply call the tool and wait. If you cannot see the image content immediately, you MUST call the 'image' tool on the 'LocalPath'.`;
 
           const replyText = await callOpenClaw({ message: desc, sessionKey, finishOnFirstText: false, timeoutMs: 120000 });
           if (replyText) {
