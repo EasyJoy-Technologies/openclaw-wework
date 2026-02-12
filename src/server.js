@@ -175,15 +175,20 @@ app.post('/wecom/callback', async (req, res) => {
 
           const rawReply = await callOpenClaw({ message: desc, sessionKey, finishOnFirstText: false, timeoutMs: 120000 });
           
-          // Filter hallucinated apologies
-          let finalText = rawReply;
+          let finalText = rawReply || '';
+          
+          // Regex to strip leading apologies if there is other content
+          // This matches "Sorry..." or "抱歉..." at the start, followed by anything, then a newline or end.
+          // It's a simple heuristic.
           const hallucinationPatterns = [
-            /^(抱歉|对不起|Sorry).*?(看|图片|上传|see|image|upload).*?(\n|$)/i
+            /^(抱歉|对不起|Sorry).{0,50}(看|图片|上传|see|image|upload).*?(\n|$)/is
           ];
+          
           for (const pattern of hallucinationPatterns) {
             if (pattern.test(finalText)) {
+               // Only strip if what remains is substantial (e.g. > 20 chars), implying a description followed.
+               // If the WHOLE message is just the apology, we keep it (so user knows it failed).
                const stripped = finalText.replace(pattern, '').trim();
-               // Only apply strip if meaningful content remains (> 20 chars)
                if (stripped.length > 20) {
                  console.log('Stripping hallucinated apology from reply');
                  finalText = stripped;
