@@ -1,34 +1,36 @@
 # OpenClaw WeCom Callback
 
-WeCom(企业微信) callback receiver for OpenClaw integration.
+企业微信回调服务，用环境变量配置敏感参数（参见 `.env.example`）。
 
-## Configure
-
-Set env (or edit `src/config.js` defaults):
+## 配置
+1) 复制 `.env.example` 为 `.env` 并填写：
 ```
-WECOM_TOKEN=2609a3ffd814f2f38bcb4156
-WECOM_AES_KEY=qMDPRi4g7ki9snNWJFpkj1iMNsxGDHpBlt8EbLhWO4m
-WECOM_CORP_ID=ww392ac7ac26269983
+WECOM_TOKEN=
+WECOM_AES_KEY=
+WECOM_CORP_ID=
+WECOM_AGENT_SECRET=
+WECOM_AGENT_ID=1000011
+GATEWAY_TOKEN=
 PORT=9000
 ```
-
-## Run
+2) 安装依赖、启动：
 ```
-npm install
+npm install --production
 npm start
 ```
-Server listens on `127.0.0.1:9000`.
+服务监听 127.0.0.1:9000。
 
-## WeCom settings
-- Callback URL: `https://oc-ww.ej-mobile.cn/wecom/callback`
-- Token / EncodingAESKey / CorpID: see above
-- Encryption mode: 安全模式
+## 功能
+- 企业微信回调校验（GET echostr）
+- 文本/图片/语音消息解密，转发到 OpenClaw，异步通过企业微信 `message/send` 推送助手回复
+- 兜底即时响应“已收到，稍后回复”满足企业微信 5 秒要求
 
-## Behavior
-- GET `/wecom/callback`: verify signature, decrypt `echostr` (if encrypted), echo back for WeCom validation.
-- POST `/wecom/callback`: verify signature against `<Encrypt>`, decrypt message XML, log it, respond `success`.
-- HEAD `/wecom/callback`: returns 200.
+## 部署
+- 回调 URL 示例：`https://<your-domain>/wecom/callback`
+- Nginx 反代至 127.0.0.1:9000，HTTPS 证书自行配置
 
-## Deploy
-Nginx already proxies 443 → `127.0.0.1:9000` with Let’s Encrypt cert on `oc-ww.ej-mobile.cn`.
-Replace the stub process with `npm start` using this app.
+## 开发
+- 代码位置：`src/`
+- 会话存储：`data/sessions.json`（按 FromUserName 建立会话）
+- 媒体下载：`tmp/` 目录
+- 日志查看：`journalctl -u openclawwework -f`
