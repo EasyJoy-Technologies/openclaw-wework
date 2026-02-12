@@ -104,10 +104,8 @@ app.post('/wecom/callback', async (req, res) => {
   // Handle Ack logic based on processing state
   const currentCount = userProcessingCounts[userId] || 0;
   if (currentCount > 0) {
-    // Already processing previous message(s), silence the ack
     res.type('text/plain').send('success');
   } else {
-    // First message in a while, send Ack
     const ackReply = buildTextReply(fromUser, toUser, '已收到，稍后回复');
     res.type('application/xml').send(ackReply);
   }
@@ -122,7 +120,6 @@ app.post('/wecom/callback', async (req, res) => {
         const content = Array.isArray(msg.Content) ? msg.Content.join('') : msg.Content;
         let replyText = '';
         try {
-          // Timeout extended to 60s
           replyText = await callOpenClaw({ message: content, sessionKey, finishOnFirstText: false, timeoutMs: 60000 });
         } catch (err) {
           console.error('openclaw error (text async)', err.message || err);
@@ -145,6 +142,7 @@ app.post('/wecom/callback', async (req, res) => {
         const description = msg.Description || '';
         const fileExt = msg.FileExt || ''; 
 
+        let success = false;
         try {
           const filePath = await downloadMedia(mediaId);
           let desc = `WeCom ${msgType} message\nMediaId: ${mediaId}\nLocalPath: ${filePath}`;
@@ -158,15 +156,18 @@ app.post('/wecom/callback', async (req, res) => {
           const replyText = await callOpenClaw({ message: desc, sessionKey, finishOnFirstText: false, timeoutMs: 120000 });
           if (replyText) {
             await sendText(fromUser, replyText);
+            success = true;
             console.log('assistant media reply sent');
           }
         } catch (err) {
           console.error('media async error', err.message || err);
-          try {
-            await sendText(fromUser, '已收到你的文件，但处理失败，请稍后重试');
-            console.log('fallback media sendText sent');
-          } catch (e2) {
-            console.error('fallback sendText error', e2.message || e2);
+          if (!success) {
+            try {
+              await sendText(fromUser, '已收到你的文件，但处理失败，请稍后重试');
+              console.log('fallback media sendText sent');
+            } catch (e2) {
+              console.error('fallback sendText error', e2.message || e2);
+            }
           }
         }
         return;
