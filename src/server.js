@@ -173,9 +173,26 @@ app.post('/wecom/callback', async (req, res) => {
           
           desc += `\n\nIMPORTANT: I have just downloaded the file to 'LocalPath'. You MUST call the 'image' tool (or 'read' for text/audio files) to see it. DO NOT apologize. DO NOT say you haven't seen it. Simply call the tool and wait. If you cannot see the image content immediately, you MUST call the 'image' tool on the 'LocalPath'.`;
 
-          const replyText = await callOpenClaw({ message: desc, sessionKey, finishOnFirstText: false, timeoutMs: 120000 });
-          if (replyText) {
-            await sendText(fromUser, replyText);
+          const rawReply = await callOpenClaw({ message: desc, sessionKey, finishOnFirstText: false, timeoutMs: 120000 });
+          
+          // Filter hallucinated apologies
+          let finalText = rawReply;
+          const hallucinationPatterns = [
+            /^(抱歉|对不起|Sorry).*?(看|图片|上传|see|image|upload).*?(\n|$)/i
+          ];
+          for (const pattern of hallucinationPatterns) {
+            if (pattern.test(finalText)) {
+               const stripped = finalText.replace(pattern, '').trim();
+               // Only apply strip if meaningful content remains (> 20 chars)
+               if (stripped.length > 20) {
+                 console.log('Stripping hallucinated apology from reply');
+                 finalText = stripped;
+               }
+            }
+          }
+
+          if (finalText) {
+            await sendText(fromUser, finalText);
             console.log('assistant media reply sent');
           }
         } catch (err) {
