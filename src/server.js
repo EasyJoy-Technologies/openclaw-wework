@@ -145,7 +145,7 @@ app.post('/wecom/callback', async (req, res) => {
         let success = false;
         try {
           const filePath = await downloadMedia(mediaId);
-          let desc = `WeCom ${msgType} message\nMediaId: ${mediaId}\nLocalPath: ${filePath}`;
+          let desc = `WeCom ${msgType} message received.\nLocalPath: ${filePath}\n\nIMPORTANT: You must use the 'image' tool (or 'read' for text files) to inspect the file at 'LocalPath' before answering. Do not guess. Describe the content of this new file.`;
           if (picUrl) desc += `\nPicUrl: ${picUrl}`;
           if (format) desc += `\nFormat: ${format}`;
           if (recognition) desc += `\nASR: ${recognition}`;
