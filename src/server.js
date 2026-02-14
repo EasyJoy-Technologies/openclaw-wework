@@ -49,11 +49,14 @@ function getSessionKey(userId) {
   return sessionKey;
 }
 
-// Dedup cache: Set of MsgIds
-const processedMsgIds = new Set();
+// Dedup cache: Map of MsgIds -> { state: 'processing' | 'done', ts }
+const processedMsgIds = new Map();
 setInterval(() => {
-  if (processedMsgIds.size > 5000) processedMsgIds.clear();
-}, 3600 * 1000);
+  const now = Date.now();
+  for (const [id, info] of processedMsgIds.entries()) {
+    if (now - info.ts > 3600 * 1000) processedMsgIds.delete(id);
+  }
+}, 10 * 60 * 1000);
 
 app.get('/wecom/callback', (req, res) => {
   const { msg_signature: msgSignature, signature, timestamp, nonce, echostr } = req.query;
@@ -105,13 +108,17 @@ app.post('/wecom/callback', async (req, res) => {
   const msgType = msg?.MsgType;
   const msgId = msg?.MsgId;
 
-  // Dedup check
+  // Dedup check: ignore only if we already finished (done) or still processing very recently
   if (msgId) {
-    if (processedMsgIds.has(msgId)) {
-      console.log(`Duplicate message ignored: ${msgId}`);
+    const entry = processedMsgIds.get(msgId);
+    if (entry?.state === 'done') {
+      console.log(`Duplicate message ignored (done): ${msgId}`);
       return res.type('text/plain').send('success');
     }
-    processedMsgIds.add(msgId);
+    if (entry?.state === 'processing' && Date.now() - entry.ts < 5 * 60 * 1000) {
+      console.log(`Duplicate message ignored (in-flight): ${msgId}`);
+      return res.type('text/plain').send('success');
+    }
   }
 
   // Ignore events
@@ -159,6 +166,12 @@ async function processBatch(userId, fromUser) {
   const sessionKey = getSessionKey(userId);
   let combinedPrompt = '';
   const tempFiles = [];
+  const batchMsgIds = batch.map(item => item.msg?.MsgId).filter(Boolean);
+
+  // Mark dedup cache as processing so retries while in-flight are ignored
+  for (const id of batchMsgIds) {
+    processedMsgIds.set(id, { state: 'processing', ts: Date.now() });
+  }
 
   // Sort: text first, then media? Or chronological?
   // Since we push in arrival order, chronological is best.
@@ -189,8 +202,7 @@ async function processBatch(userId, fromUser) {
   }
 
   try {
-    // Call assistant with combined prompt
-    // Timeout 120s because batch might have multiple images
+    // Call assistant with combined prompt (timeout aligned at 120s)
     const replyText = await callOpenClaw({ message: combinedPrompt, sessionKey, finishOnFirstText: false, timeoutMs: 120000 });
     
     // Filter apologies
@@ -211,8 +223,18 @@ async function processBatch(userId, fromUser) {
       await sendText(fromUser, finalText);
       console.log('Batch reply sent');
     }
+    // Mark dedup cache as done only after successful processing
+    for (const id of batchMsgIds) {
+      processedMsgIds.set(id, { state: 'done', ts: Date.now() });
+    }
   } catch (err) {
-    console.error('Batch processing error', err.message || err);
+    console.error('Batch processing error', err?.message || err);
+    if (err?.stack) console.error(err.stack);
+    if (err?.response?.data) console.error('Response data:', err.response.data);
+    // Allow retry if WeCom replays
+    for (const id of batchMsgIds) {
+      processedMsgIds.delete(id);
+    }
     try {
       await sendText(fromUser, '消息处理遇到问题，请稍后重试');
     } catch (_) {}
@@ -222,12 +244,8 @@ async function processBatch(userId, fromUser) {
       if (fs.existsSync(fp)) fs.unlink(fp, () => {});
     }
     // Mark processing done
-    // If new messages arrived during processing, buffer.messages is not empty,
-    // but the timer isn't running? No, new messages set new timer.
-    // So we just clear the flag.
     buffer.processing = false;
     
-    // Clean up empty user entry?
     if (buffer.messages.length === 0 && !buffer.timer) {
       delete userBuffers[userId];
     }
