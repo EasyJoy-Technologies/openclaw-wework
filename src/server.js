@@ -2,9 +2,9 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const xml2js = require('xml2js');
 const fs = require('fs');
-const { port, token, encodingAESKey, corpId } = require('./config');
+const axios = require('axios');
+const { port, token, encodingAESKey, corpId, clawUrl, clawToken } = require('./config');
 const { crypt, verifySignature, decryptEcho, decryptMessage } = require('./wecom');
-const { callOpenClaw } = require('./openclawClient');
 const { getSession, setSession } = require('./sessionStore');
 const { downloadMedia } = require('./media');
 const { sendText } = require('./send');
@@ -18,6 +18,34 @@ const userBuffers = {};
 const DEBOUNCE_MS = 1500; // Wait 1.5s to combine text+media
 
 app.use(bodyParser.text({ type: '*/xml' }));
+
+async function callOpenClaw(prompt) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (clawToken) headers['Authorization'] = `Bearer ${clawToken}`;
+  const res = await axios.post(clawUrl, {
+    model: 'openclaw:main',
+    input: prompt,
+    stream: false
+  }, { headers, timeout: 60000 });
+
+  const data = res.data;
+  if (data && data.output && Array.isArray(data.output)) {
+    const textParts = [];
+    data.output.forEach(item => {
+      if (item?.content && Array.isArray(item.content)) {
+        item.content.forEach(part => {
+          if (part?.type === 'output_text' && part.text) textParts.push(part.text);
+        });
+      }
+    });
+    if (textParts.length > 0) return textParts.join('\n');
+  }
+  if (data?.response?.output) {
+    const text = JSON.stringify(data.response.output);
+    if (text) return text;
+  }
+  return '';
+}
 
 function buildTextReply(toUser, fromUser, content) {
   const ts = Math.floor(Date.now() / 1000);
@@ -203,7 +231,7 @@ async function processBatch(userId, fromUser) {
 
   try {
     // Call assistant with combined prompt (timeout aligned at 120s)
-    const replyText = await callOpenClaw({ message: combinedPrompt, sessionKey, finishOnFirstText: false, timeoutMs: 120000 });
+    const replyText = await callOpenClaw(combinedPrompt);
     
     // Filter apologies
     let finalText = replyText || '';
