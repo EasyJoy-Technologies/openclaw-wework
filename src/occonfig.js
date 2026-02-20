@@ -30,6 +30,7 @@ function resolveGatewayConfig() {
   const fallbackPort = cfg.gateway?.port || 18789;
   const url = normalizeWsUrl(fromEnvUrl || cfg.gateway?.remote?.url || `ws://127.0.0.1:${fallbackPort}/ws`);
   const token = fromEnvToken || cfg.gateway?.remote?.token || cfg.gateway?.auth?.token || '';
+  console.error("gateway token hash", require("crypto").createHash("sha256").update(String(token)).digest("hex"));
   return { gatewayUrl: url, gatewayToken: token };
 }
 

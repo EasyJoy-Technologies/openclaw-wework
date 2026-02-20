@@ -231,7 +231,7 @@ async function processBatch(userId, fromUser) {
 
   try {
     // Call assistant with combined prompt (timeout aligned at 120s)
-    const replyText = await callOpenClaw(combinedPrompt);
+    const replyText = await callOpenClaw({ message: combinedPrompt, sessionKey, timeoutMs: 120000 });
     
     // Filter apologies
     let finalText = replyText || '';

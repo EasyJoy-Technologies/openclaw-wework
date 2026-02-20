@@ -1,126 +1,79 @@
-const WebSocket = require('ws');
 const crypto = require('crypto');
 const { gatewayUrl, gatewayToken } = require('./occonfig');
+const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
 function uuid() {
   return crypto.randomUUID();
 }
 
-function callOpenClaw({ message, sessionKey, agentId = 'main', timeoutMs = 120000, finishOnFirstText = false, retryOnce = true }) {
-  return new Promise((resolve, reject) => {
-    if (!gatewayToken) {
-      return reject(new Error('gateway token missing'));
-    }
-    if (!gatewayUrl) {
-      return reject(new Error('gateway url missing'));
-    }
+async function callOpenClaw({ message, sessionKey, agentId = 'main', timeoutMs = 120000 }) {
+  if (!gatewayToken) throw new Error('gateway token missing');
+  if (!gatewayUrl) throw new Error('gateway url missing');
 
-    const reqId = uuid();
-    const runId = uuid();
-    let ws;
-    let settled = false;
-    let closing = false;
-    let lastText = '';
-    let hasRetried = false;
+  // Derive responses endpoint from gatewayUrl base
+  // normalize ws:// -> http://, wss:// -> https://, strip trailing /ws
+  let base = gatewayUrl.replace(/^ws:/, 'http:').replace(/^wss:/, 'https:');
+  base = base.replace(/\/ws$/i, '').replace(/\/$/, '');
+  const url = `${base}/v1/responses`;
 
-    const cleanup = () => {
-      clearTimeout(timeout);
-      if (ws) {
-        ws.removeAllListeners('open');
-        ws.removeAllListeners('message');
-        ws.removeAllListeners('error');
-        ws.removeAllListeners('close');
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  const payload = {
+    model: 'openai-codex/gpt-5.1-codex-max',
+    input: [
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: message }
+        ]
       }
-    };
+    ],
+    stream: false
+  };
 
-    const finish = (err, result) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      closing = true;
-      try {
-        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-          ws.close();
-        }
-      } catch (_) {}
-      if (err) return reject(err);
-      resolve(result || lastText || '');
-    };
-
-    const start = () => {
-      ws = new WebSocket(gatewayUrl);
-      ws.on('open', () => {
-        ws.send(JSON.stringify({
-          type: 'req',
-          id: 'connect-' + reqId,
-          method: 'connect',
-          params: {
-            minProtocol: 3,
-            maxProtocol: 3,
-            auth: { token: gatewayToken },
-            client: { id: 'cli', displayName: 'wecom-bridge', version: '0.1', platform: 'node', mode: 'cli' }
-          }
-        }));
-      });
-
-      ws.on('message', (data) => {
-        let msg;
-        try { msg = JSON.parse(data.toString()); } catch (_) { return; }
-
-        if (msg.type === 'event' && msg.event === 'connect.challenge') return;
-
-        if (msg.type === 'res' && msg.id.startsWith('connect-')) {
-          if (!msg.ok) {
-            console.error('gateway connect res', JSON.stringify(msg));
-            return finish(new Error(msg.errorMessage || msg.error || 'gateway connect failed'));
-          }
-          ws.send(JSON.stringify({
-            type: 'req',
-            id: 'agent-' + reqId,
-            method: 'agent',
-            params: { agentId, sessionKey, message, thinking: 'low', idempotencyKey: runId }
-          }));
-          return;
-        }
-
-        if (msg.type === 'res' && msg.id === 'agent-' + reqId) {
-          if (!msg.ok) {
-            console.error('gateway agent res', JSON.stringify(msg));
-            return finish(new Error(msg.errorMessage || msg.error || 'gateway agent error'));
-          }
-          return; // ack only
-        }
-
-        if (msg.type === 'event' && msg.event === 'agent' && msg.payload?.runId === runId) {
-          if (msg.payload.stream === 'assistant' && msg.payload.data?.text) {
-            lastText = msg.payload.data.text;
-            if (finishOnFirstText) return finish(null, lastText);
-          }
-          if (msg.payload.stream === 'lifecycle' && msg.payload.data?.phase === 'end') {
-            return finish(null, lastText);
-          }
-        }
-      });
-
-      ws.on('error', (err) => {
-        if (settled) return;
-        finish(err);
-      });
-
-      ws.on('close', () => {
-        if (settled || closing) return;
-        if (retryOnce && !hasRetried) {
-          hasRetried = true;
-          setTimeout(() => start(), 300);
-          return;
-        }
-        finish(new Error('gateway closed'));
-      });
-    };
-
-    const timeout = setTimeout(() => finish(new Error('gateway timeout')), timeoutMs);
-    start();
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${gatewayToken}`
+    },
+    body: JSON.stringify(payload),
+    signal: controller.signal
   });
+  clearTimeout(t);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`responses ${res.status}: ${text}`);
+  }
+  const data = await res.json();
+  let text = '';
+  if (Array.isArray(data.output)) {
+    const parts = [];
+    for (const item of data.output) {
+      if (typeof item === 'string') { parts.push(item); continue; }
+      if (item?.content) {
+        if (typeof item.content === 'string') parts.push(item.content);
+        else if (Array.isArray(item.content)) {
+          for (const c of item.content) {
+            if (typeof c === 'string') parts.push(c);
+            else if (c?.text) parts.push(c.text);
+          }
+        }
+      }
+      if (item?.text) parts.push(item.text);
+    }
+    text = parts.filter(Boolean).join('\n');
+  } else if (typeof data.output === 'string') {
+    text = data.output;
+  } else if (data.output?.content) {
+    if (typeof data.output.content === 'string') text = data.output.content;
+    else if (Array.isArray(data.output.content)) {
+      text = data.output.content.map((c) => (typeof c === 'string' ? c : c?.text || '')).filter(Boolean).join('\n');
+    }
+  }
+  return text || '';
 }
 
 module.exports = { callOpenClaw };
