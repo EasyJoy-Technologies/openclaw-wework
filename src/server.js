@@ -2,49 +2,32 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const xml2js = require('xml2js');
 const fs = require('fs');
-const axios = require('axios');
-const { port, token, encodingAESKey, corpId, clawUrl, clawToken } = require('./config');
+const { port, token, encodingAESKey, corpId } = require('./config');
 const { crypt, verifySignature, decryptEcho, decryptMessage } = require('./wecom');
-const { getSession, setSession } = require('./sessionStore');
+const { getHistory, appendHistory, clearHistory } = require('./sessionStore');
 const { downloadMedia } = require('./media');
 const { sendText } = require('./send');
+const { callOpenClaw } = require('./openclawClient');
 
 const app = express();
 const builder = new xml2js.Builder({ headless: true, cdata: true, rootName: 'xml' });
 
-// --- Message Buffer State ---
+// --- 用户消息合并缓冲（防止图片+文字拆成两条）---
 // Key: userId, Value: { timer, messages: [], processing: bool }
 const userBuffers = {};
-const DEBOUNCE_MS = 1500; // Wait 1.5s to combine text+media
+const DEBOUNCE_MS = 1500;
 
 app.use(bodyParser.text({ type: '*/xml' }));
 
-async function callOpenClaw(prompt) {
-  const headers = { 'Content-Type': 'application/json' };
-  if (clawToken) headers['Authorization'] = `Bearer ${clawToken}`;
-  const res = await axios.post(clawUrl, {
-    model: 'openclaw:main',
-    input: prompt,
-    stream: false
-  }, { headers, timeout: 60000 });
+// --- 特殊指令 ---
+const CMD_CLEAR = ['清除记忆', '重置对话', '清空记录', '清空对话', '/clear', '/reset'];
+const CMD_SUMMARY = ['帮我总结', '总结一下', '总结对话', '/summary'];
 
-  const data = res.data;
-  if (data && data.output && Array.isArray(data.output)) {
-    const textParts = [];
-    data.output.forEach(item => {
-      if (item?.content && Array.isArray(item.content)) {
-        item.content.forEach(part => {
-          if (part?.type === 'output_text' && part.text) textParts.push(part.text);
-        });
-      }
-    });
-    if (textParts.length > 0) return textParts.join('\n');
-  }
-  if (data?.response?.output) {
-    const text = JSON.stringify(data.response.output);
-    if (text) return text;
-  }
-  return '';
+function detectCommand(text) {
+  const t = text.trim();
+  if (CMD_CLEAR.includes(t)) return 'clear';
+  if (CMD_SUMMARY.includes(t)) return 'summary';
+  return null;
 }
 
 function buildTextReply(toUser, fromUser, content) {
@@ -68,16 +51,7 @@ function buildTextReply(toUser, fromUser, content) {
   return resp;
 }
 
-function getSessionKey(userId) {
-  let sessionKey = getSession(userId);
-  if (!sessionKey) {
-    sessionKey = `wecom:${userId}`;
-    setSession(userId, sessionKey);
-  }
-  return sessionKey;
-}
-
-// Dedup cache: Map of MsgIds -> { state: 'processing' | 'done', ts }
+// Dedup cache
 const processedMsgIds = new Map();
 setInterval(() => {
   const now = Date.now();
@@ -136,7 +110,7 @@ app.post('/wecom/callback', async (req, res) => {
   const msgType = msg?.MsgType;
   const msgId = msg?.MsgId;
 
-  // Dedup check: ignore only if we already finished (done) or still processing very recently
+  // Dedup
   if (msgId) {
     const entry = processedMsgIds.get(msgId);
     if (entry?.state === 'done') {
@@ -149,32 +123,26 @@ app.post('/wecom/callback', async (req, res) => {
     }
   }
 
-  // Ignore events
+  // 忽略事件
   if (msgType === 'event') {
     return res.type('text/plain').send('success');
   }
 
-  // Init buffer for user if needed
   if (!userBuffers[userId]) {
     userBuffers[userId] = { timer: null, messages: [], processing: false };
   }
   const buffer = userBuffers[userId];
 
-  // If buffer empty and not processing, send immediate Ack
   if (buffer.messages.length === 0 && !buffer.processing) {
-    const ackReply = buildTextReply(fromUser, toUser, '已收到，稍后回复');
+    const ackReply = buildTextReply(fromUser, toUser, '收到，稍等...');
     res.type('application/xml').send(ackReply);
   } else {
-    // Already buffered or processing previous batch, silence this one
     res.type('text/plain').send('success');
   }
 
-  // Add message to buffer
   buffer.messages.push({ msg, type: msgType });
 
-  // Reset debounce timer
   if (buffer.timer) clearTimeout(buffer.timer);
-  
   buffer.timer = setTimeout(() => {
     processBatch(userId, fromUser);
   }, DEBOUNCE_MS);
@@ -186,72 +154,96 @@ async function processBatch(userId, fromUser) {
 
   buffer.processing = true;
   const batch = [...buffer.messages];
-  buffer.messages = []; // clear buffer for next batch
+  buffer.messages = [];
   buffer.timer = null;
 
   console.log(`Processing batch for ${userId}: ${batch.length} messages`);
 
-  const sessionKey = getSessionKey(userId);
-  let combinedPrompt = '';
-  const tempFiles = [];
   const batchMsgIds = batch.map(item => item.msg?.MsgId).filter(Boolean);
-
-  // Mark dedup cache as processing so retries while in-flight are ignored
   for (const id of batchMsgIds) {
     processedMsgIds.set(id, { state: 'processing', ts: Date.now() });
   }
 
-  // Sort: text first, then media? Or chronological?
-  // Since we push in arrival order, chronological is best.
-  // But we want to ensure text context is applied to image.
-  
-  for (const item of batch) {
-    const m = item.msg;
-    if (item.type === 'text') {
-      combinedPrompt += `User Text: ${m.Content}\n\n`;
-    } else if (['image', 'voice', 'audio', 'file'].includes(item.type)) {
-      try {
-        const mediaId = m.MediaId;
-        const filePath = await downloadMedia(mediaId);
-        tempFiles.push(filePath);
-        combinedPrompt += `User File (${item.type}):\nMediaId: ${mediaId}\nLocalPath: ${filePath}\n`;
-        if (m.PicUrl) combinedPrompt += `PicUrl: ${m.PicUrl}\n`;
-        if (m.Recognition) combinedPrompt += `ASR: ${m.Recognition}\n`;
-        combinedPrompt += '\n';
-      } catch (e) {
-        console.error('Media download failed', e);
-        combinedPrompt += `[Media download failed: ${m.MediaId}]\n`;
-      }
-    }
-  }
-
-  if (tempFiles.length > 0) {
-    combinedPrompt += `\nIMPORTANT: I have just downloaded ${tempFiles.length} file(s) to the local paths listed above. You MUST call the 'image' tool (or 'read' for text/audio) to inspect them. DO NOT apologize. DO NOT say you haven't seen them. Simply call the tool and wait for the content.`;
-  }
+  const tempFiles = [];
 
   try {
-    // Call assistant with combined prompt (timeout aligned at 120s)
-    const replyText = await callOpenClaw({ message: combinedPrompt, sessionKey, timeoutMs: 120000 });
-    
-    // Filter apologies
-    let finalText = replyText || '';
-    const hallucinationPatterns = [
-      /^(抱歉|对不起|Sorry).{0,50}(看|图片|上传|see|image|upload).*?(\n|$)/is
-    ];
-    for (const pattern of hallucinationPatterns) {
-      if (pattern.test(finalText)) {
-         const stripped = finalText.replace(pattern, '').trim();
-         if (stripped.length > 20) {
-           finalText = stripped;
-         }
+    // 合并本次 batch 为一段用户输入
+    let userInput = '';
+    for (const item of batch) {
+      const m = item.msg;
+      if (item.type === 'text') {
+        userInput += (userInput ? '\n' : '') + (m.Content || '');
+      } else if (['image', 'voice', 'audio', 'file'].includes(item.type)) {
+        try {
+          const mediaId = m.MediaId;
+          const filePath = await downloadMedia(mediaId);
+          tempFiles.push(filePath);
+          userInput += `\n[${item.type}文件已下载到: ${filePath}`;
+          if (m.PicUrl) userInput += `, PicUrl: ${m.PicUrl}`;
+          if (m.Recognition) userInput += `, 语音识别: ${m.Recognition}`;
+          userInput += ']';
+        } catch (e) {
+          console.error('Media download failed', e);
+          userInput += `\n[媒体下载失败: ${m.MediaId}]`;
+        }
       }
+    }
+
+    userInput = userInput.trim();
+    if (!userInput) {
+      buffer.processing = false;
+      return;
+    }
+
+    // --- 特殊指令处理 ---
+    const cmd = detectCommand(userInput);
+
+    if (cmd === 'clear') {
+      clearHistory(userId);
+      await sendText(fromUser, '✅ 对话记忆已清除，我们重新开始吧！');
+      for (const id of batchMsgIds) processedMsgIds.set(id, { state: 'done', ts: Date.now() });
+      buffer.processing = false;
+      return;
+    }
+
+    if (cmd === 'summary') {
+      const history = getHistory(userId);
+      if (history.length === 0) {
+        await sendText(fromUser, '当前没有对话记录可以总结。');
+        for (const id of batchMsgIds) processedMsgIds.set(id, { state: 'done', ts: Date.now() });
+        buffer.processing = false;
+        return;
+      }
+      userInput = '请总结一下我们到目前为止的对话内容，分点列出主要讨论的问题和结论。';
+    }
+
+    // --- 载入历史，调用 AI ---
+    const history = getHistory(userId);
+
+    if (tempFiles.length > 0) {
+      userInput += `\n\nIMPORTANT: 请调用 image/read 工具查看以上本地路径的文件，不要道歉或说没有看到。`;
+    }
+
+    const replyText = await callOpenClaw({ message: userInput, history, timeoutMs: 120000 });
+
+    let finalText = (replyText || '').trim();
+
+    // 过滤幻觉道歉
+    if (finalText) {
+      const hallucinationPattern = /^(抱歉|对不起|Sorry).{0,50}(看|图片|上传|see|image|upload).*?(\n|$)/is;
+      const stripped = finalText.replace(hallucinationPattern, '').trim();
+      if (stripped.length > 20) finalText = stripped;
     }
 
     if (finalText) {
+      // 写入历史（本次用户消息 + AI 回复）
+      appendHistory(userId, 'user', userInput);
+      appendHistory(userId, 'assistant', finalText);
+
       await sendText(fromUser, finalText);
-      console.log('Batch reply sent');
+      console.log(`Reply sent to ${userId}`);
     }
-    // Mark dedup cache as done only after successful processing
+
     for (const id of batchMsgIds) {
       processedMsgIds.set(id, { state: 'done', ts: Date.now() });
     }
@@ -259,21 +251,15 @@ async function processBatch(userId, fromUser) {
     console.error('Batch processing error', err?.message || err);
     if (err?.stack) console.error(err.stack);
     if (err?.response?.data) console.error('Response data:', err.response.data);
-    // Allow retry if WeCom replays
-    for (const id of batchMsgIds) {
-      processedMsgIds.delete(id);
-    }
+    for (const id of batchMsgIds) processedMsgIds.delete(id);
     try {
       await sendText(fromUser, '消息处理遇到问题，请稍后重试');
     } catch (_) {}
   } finally {
-    // Cleanup temp files
     for (const fp of tempFiles) {
       if (fs.existsSync(fp)) fs.unlink(fp, () => {});
     }
-    // Mark processing done
     buffer.processing = false;
-    
     if (buffer.messages.length === 0 && !buffer.timer) {
       delete userBuffers[userId];
     }
@@ -287,5 +273,5 @@ app.listen(port, '127.0.0.1', () => {
   console.log(`WeCom callback listening on 127.0.0.1:${port}`);
   console.log(`CorpID=${corpId}`);
   console.log(`Token=${token}`);
-  console.log(`AES=${encodingAESKey.slice(0,4)}...`);
+  console.log(`AES=${encodingAESKey.slice(0, 4)}...`);
 });
